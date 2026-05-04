@@ -1,0 +1,48 @@
+import asyncio
+import logging
+import os
+import anthropic
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.filters import Command
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer(
+        "👋 Привет! Я SEO бот.\n\n"
+        "Просто напиши тему статьи и я сгенерирую SEO текст!"
+    )
+
+@dp.message(F.text)
+async def generate(message: Message):
+    await message.answer("⏳ Генерирую статью, подожди 20-30 секунд...")
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=3000,
+            messages=[{
+                "role": "user",
+                "content": f"Напиши SEO статью на тему: {message.text}. Структура: H1, введение, 3-4 раздела H2, заключение. Язык: русский."
+            }]
+        )
+        article = response.content[0].text
+        if len(article) > 4000:
+            parts = [article[i:i+4000] for i in range(0, len(article), 4000)]
+            for part in parts:
+                await message.answer(part)
+        else:
+            await message.answer(article)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
