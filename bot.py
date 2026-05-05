@@ -11,12 +11,12 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=os.getenv("BOT_TOKEN"))
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(storage=MemoryStorage())
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -26,38 +26,84 @@ WP_USER = os.getenv("WP_USER", "")
 WP_PASSWORD = os.getenv("WP_PASSWORD", "")
 
 
-async def generate_article(topic: str) -> str:
+class ArticleFlow(StatesGroup):
+    waiting_size = State()
+    waiting_publish = State()
+
+
+# ── Генерация статьи ──
+async def generate_article(topic: str, chars: int) -> str:
+    words = chars // 5
     response = claude.messages.create(
         model="claude-opus-4-5",
-        max_tokens=3000,
+        max_tokens=4000,
         messages=[{
             "role": "user",
-            "content": f"Напиши SEO статью на тему: {topic}. Структура: H1, введение, 3-4 раздела H2, заключение. Язык: русский."
+            "content": (
+                f"Напиши профессиональную SEO статью на тему: «{topic}»\n\n"
+                f"Требования:\n"
+                f"- Объём: примерно {words} слов ({chars} символов)\n"
+                f"- Структура: H1 заголовок, введение, 3-5 разделов H2, заключение\n"
+                f"- Ключевые слова вписаны естественно\n"
+                f"- Уникальный живой текст\n"
+                f"- Язык: русский\n"
+                f"- Форматирование: Markdown"
+            )
         }]
     )
     return response.content[0].text
 
 
-async def publish_to_channel(text: str) -> bool:
+# ── Распознавание голоса ──
+async def transcribe_voice(file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.read()
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        tmp.write(data)
+        path = tmp.name
+    with open(path, "rb") as f:
+        result = groq_client.audio.transcriptions.create(
+            file=("voice.ogg", f.read()),
+            model="whisper-large-v3",
+            language="ru"
+        )
+    os.unlink(path)
+    return result.text
+
+
+# ── Публикация в канал ──
+async def publish_channel(text: str) -> bool:
     try:
-        await bot.send_message(chat_id=CHANNEL_ID, text=text[:4096])
+        if not CHANNEL_ID:
+            return False
+        # Обрезаем до лимита Telegram
+        msg = text[:4096]
+        await bot.send_message(chat_id=CHANNEL_ID, text=msg)
         return True
     except Exception as e:
-        logging.error(f"Channel error: {e}")
+        logging.error(f"Channel: {e}")
         return False
 
 
-async def publish_to_wordpress(title: str, content: str) -> str | None:
+# ── Публикация в WordPress ──
+async def publish_wp(title: str, content: str) -> str | None:
     if not WP_URL:
         return None
     try:
         import base64
-        credentials = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
+        creds = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
         headers = {
-            "Authorization": f"Basic {credentials}",
+            "Authorization": f"Basic {creds}",
             "Content-Type": "application/json"
         }
-        payload = {"title": title, "content": content, "status": "publish"}
+        payload = {
+            "title": title,
+            "content": content,
+            "status": "publish"
+        }
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{WP_URL}/wp-json/wp/v2/posts",
@@ -67,127 +113,183 @@ async def publish_to_wordpress(title: str, content: str) -> str | None:
                 if resp.status in (200, 201):
                     data = await resp.json()
                     return data.get("link")
+                else:
+                    text = await resp.text()
+                    logging.error(f"WP error {resp.status}: {text}")
     except Exception as e:
-        logging.error(f"WP error: {e}")
+        logging.error(f"WP: {e}")
     return None
 
 
-def make_publish_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📢 В Telegram канал", callback_data="pub_channel")
-    builder.button(text="🌐 В WordPress", callback_data="pub_wp")
-    builder.button(text="✅ Везде сразу", callback_data="pub_all")
-    builder.adjust(1)
-    return builder.as_markup()
+# ── Клавиатура выбора размера ──
+def size_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="📄 3 000 символов", callback_data="size_3000")
+    b.button(text="📃 5 000 символов", callback_data="size_5000")
+    b.button(text="📜 8 000 символов", callback_data="size_8000")
+    b.adjust(1)
+    return b.as_markup()
 
 
+# ── Клавиатура публикации ──
+def publish_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="📢 В Telegram канал", callback_data="pub_channel")
+    b.button(text="🌐 В WordPress", callback_data="pub_wp")
+    b.button(text="✅ Везде сразу", callback_data="pub_all")
+    b.button(text="❌ Не публиковать", callback_data="pub_none")
+    b.adjust(1)
+    return b.as_markup()
+
+
+# ── /start ──
 @dp.message(Command("start"))
-async def start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
-        "👋 Привет! Я SEO бот v3.\n\n"
-        "📝 Напиши тему статьи текстом\n"
-        "🎤 Или отправь голосовое сообщение\n\n"
-        "После генерации я спрошу куда публиковать!"
+        "👋 Привет! Я SEO-агент.\n\n"
+        "Как работаю:\n"
+        "1️⃣ Ты пишешь тему текстом или голосовым\n"
+        "2️⃣ Я спрашиваю сколько символов\n"
+        "3️⃣ Генерирую статью\n"
+        "4️⃣ Ты выбираешь куда публиковать\n\n"
+        "📝 Напиши тему или отправь голосовое!"
     )
 
 
+# ── Голосовое сообщение ──
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
     await message.answer("🎤 Распознаю голосовое...")
     try:
-        file = await bot.get_file(message.voice.file_id)
-        file_url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file_url) as resp:
-                voice_data = await resp.read()
-
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp.write(voice_data)
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            transcription = groq_client.audio.transcriptions.create(
-                file=("voice.ogg", f.read()),
-                model="whisper-large-v3",
-                language="ru"
-            )
-        os.unlink(tmp_path)
-
-        topic = transcription.text
-        await message.answer(f"✅ Распознано: *{topic}*", parse_mode="Markdown")
-        await process_topic(message, topic, state)
-
+        topic = await transcribe_voice(message.voice.file_id)
+        if not topic.strip():
+            await message.answer("❌ Не удалось распознать. Попробуй ещё раз.")
+            return
+        await message.answer(f"✅ Распознано:\n*{topic}*", parse_mode="Markdown")
+        await state.update_data(topic=topic)
+        await state.set_state(ArticleFlow.waiting_size)
+        await message.answer(
+            "📏 Сколько символов нужно в статье?",
+            reply_markup=size_keyboard()
+        )
     except Exception as e:
         await message.answer(f"❌ Ошибка распознавания: {e}")
 
 
+# ── Текстовое сообщение ──
 @dp.message(F.text)
 async def handle_text(message: Message, state: FSMContext):
-    await process_topic(message, message.text, state)
+    current = await state.get_state()
+    if current is not None:
+        return  # игнорируем если уже в процессе
+    topic = message.text.strip()
+    await state.update_data(topic=topic)
+    await state.set_state(ArticleFlow.waiting_size)
+    await message.answer(
+        f"✅ Тема: *{topic}*\n\n📏 Сколько символов нужно?",
+        parse_mode="Markdown",
+        reply_markup=size_keyboard()
+    )
 
 
-async def process_topic(message: Message, topic: str, state: FSMContext):
-    await message.answer("⏳ Генерирую статью, подожди 20-30 секунд...")
+# ── Выбор размера ──
+@dp.callback_query(F.data.startswith("size_"))
+async def handle_size(callback: CallbackQuery, state: FSMContext):
+    chars = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    topic = data.get("topic", "")
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"⏳ Генерирую статью ~{chars} символов...\nЭто займёт 20-40 секунд.")
+    await callback.answer()
+
     try:
-        article = await generate_article(topic)
-        await state.update_data(article=article, topic=topic)
+        article = await generate_article(topic, chars)
+        await state.update_data(article=article)
+        await state.set_state(ArticleFlow.waiting_publish)
 
+        # Отправляем статью частями если длинная
         if len(article) > 4000:
             parts = [article[i:i+4000] for i in range(0, len(article), 4000)]
-            for part in parts:
-                await message.answer(part)
+            for i, part in enumerate(parts):
+                await callback.message.answer(
+                    f"📄 *Часть {i+1}/{len(parts)}*\n\n{part}",
+                    parse_mode="Markdown"
+                )
         else:
-            await message.answer(article)
+            await callback.message.answer(article, parse_mode="Markdown")
 
-        await message.answer(
-            "✅ Статья готова! Куда публикуем?",
-            reply_markup=make_publish_keyboard()
+        await callback.message.answer(
+            "✅ Статья готова!\n\n📤 Куда публикуем?",
+            reply_markup=publish_keyboard()
         )
+
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await state.clear()
+        await callback.message.answer(f"❌ Ошибка генерации: {e}")
 
 
+# ── Публикация: канал ──
 @dp.callback_query(F.data == "pub_channel")
-async def pub_channel(callback: CallbackQuery, state: FSMContext):
+async def pub_channel_cb(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     article = data.get("article", "")
     topic = data.get("topic", "")
-    ok = await publish_to_channel(f"📝 {topic}\n\n{article}")
-    await callback.message.answer("✅ Опубликовано в канал!" if ok else "❌ Ошибка публикации в канал")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "pub_wp")
-async def pub_wp(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    article = data.get("article", "")
-    topic = data.get("topic", "")
-    await callback.message.answer("⏳ Публикую в WordPress...")
-    link = await publish_to_wordpress(topic, article)
-    if link:
-        await callback.message.answer(f"✅ Опубликовано!\n🔗 {link}")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    ok = await publish_channel(f"📝 {topic}\n\n{article}")
+    if ok:
+        await callback.message.answer("✅ Опубликовано в Telegram канал!")
     else:
-        await callback.message.answer("❌ Ошибка WordPress. Проверь WP_URL, WP_USER, WP_PASSWORD в Variables.")
+        await callback.message.answer("❌ Ошибка. Проверь TELEGRAM_CHANNEL_ID и что бот добавлен админом в канал.")
+    await state.clear()
     await callback.answer()
 
 
-@dp.callback_query(F.data == "pub_all")
-async def pub_all(callback: CallbackQuery, state: FSMContext):
+# ── Публикация: WordPress ──
+@dp.callback_query(F.data == "pub_wp")
+async def pub_wp_cb(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     article = data.get("article", "")
     topic = data.get("topic", "")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("⏳ Публикую в WordPress...")
+    link = await publish_wp(topic, article)
+    if link:
+        await callback.message.answer(f"✅ Опубликовано в WordPress!\n🔗 {link}")
+    else:
+        await callback.message.answer("❌ Ошибка WordPress. Проверь WP_URL, WP_USER, WP_PASSWORD.")
+    await state.clear()
+    await callback.answer()
+
+
+# ── Публикация: везде ──
+@dp.callback_query(F.data == "pub_all")
+async def pub_all_cb(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    article = data.get("article", "")
+    topic = data.get("topic", "")
+    await callback.message.edit_reply_markup(reply_markup=None)
     result = ""
 
-    if CHANNEL_ID:
-        ok = await publish_to_channel(f"📝 {topic}\n\n{article}")
-        result += "✅ Канал\n" if ok else "❌ Канал — ошибка\n"
+    ok = await publish_channel(f"📝 {topic}\n\n{article}")
+    result += "✅ Telegram канал\n" if ok else "❌ Telegram — ошибка\n"
 
     await callback.message.answer("⏳ Публикую в WordPress...")
-    link = await publish_to_wordpress(topic, article)
+    link = await publish_wp(topic, article)
     result += f"✅ WordPress: {link}\n" if link else "❌ WordPress — ошибка\n"
 
-    await callback.message.answer(f"📢 *Результат:*\n{result}", parse_mode="Markdown")
+    await callback.message.answer(f"📢 *Результат публикации:*\n\n{result}", parse_mode="Markdown")
+    await state.clear()
+    await callback.answer()
+
+
+# ── Не публиковать ──
+@dp.callback_query(F.data == "pub_none")
+async def pub_none_cb(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("👍 Хорошо! Статья сохранена только здесь.")
+    await state.clear()
     await callback.answer()
 
 
