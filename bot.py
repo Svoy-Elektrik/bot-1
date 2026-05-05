@@ -84,7 +84,7 @@ def make_publish_keyboard():
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
-        "👋 Привет! я твой  бот v3.\n\n"
+        "👋 Привет! Я SEO бот v3.\n\n"
         "📝 Напиши тему статьи текстом\n"
         "🎤 Или отправь голосовое сообщение\n\n"
         "После генерации я спрошу куда публиковать!"
