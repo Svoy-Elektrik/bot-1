@@ -4,6 +4,7 @@ import os
 import tempfile
 import anthropic
 import aiohttp
+from groq import Groq
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -17,11 +18,13 @@ bot = Bot(token=os.getenv("BOT_TOKEN"))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 WP_URL = os.getenv("WP_URL", "")
 WP_USER = os.getenv("WP_USER", "")
 WP_PASSWORD = os.getenv("WP_PASSWORD", "")
+
 
 async def generate_article(topic: str) -> str:
     response = claude.messages.create(
@@ -34,42 +37,6 @@ async def generate_article(topic: str) -> str:
     )
     return response.content[0].text
 
-async def transcribe_voice(file_path: str) -> str:
-    import wave, struct, math
-    # Используем бесплатный speech-to-text через wit.ai или просто просим пользователя
-    # Для простоты — конвертируем через ffmpeg и отправляем в Anthropic
-    with open(file_path, "rb") as f:
-        audio_data = f.read()
-    import base64
-    audio_b64 = base64.b64encode(audio_data).decode()
-    response = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=500,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Это голосовое сообщение в формате OGG. Расшифруй что говорит человек и верни только текст без комментариев."
-                },
-                {
-                    "type": "text", 
-                    "text": f"[Аудио файл получен, размер: {len(audio_data)} байт. К сожалению Claude не может обрабатывать аудио напрямую. Верни текст: 'AUDIO_NOT_SUPPORTED']"
-                }
-            ]
-        }]
-    )
-    return ""
-
-async def download_voice(file_id: str) -> str:
-    file = await bot.get_file(file_id)
-    file_url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(file_url) as resp:
-            voice_data = await resp.read()
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp.write(voice_data)
-        return tmp.name
 
 async def publish_to_channel(text: str) -> bool:
     try:
@@ -78,6 +45,7 @@ async def publish_to_channel(text: str) -> bool:
     except Exception as e:
         logging.error(f"Channel error: {e}")
         return False
+
 
 async def publish_to_wordpress(title: str, content: str) -> str | None:
     if not WP_URL:
@@ -103,6 +71,7 @@ async def publish_to_wordpress(title: str, content: str) -> str | None:
         logging.error(f"WP error: {e}")
     return None
 
+
 def make_publish_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="📢 В Telegram канал", callback_data="pub_channel")
@@ -111,26 +80,52 @@ def make_publish_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
+
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
         "👋 Привет! Я SEO бот.\n\n"
         "📝 Напиши тему статьи текстом\n"
-        "🎤 Или отправь голосовое — я распознаю тему\n\n"
+        "🎤 Или отправь голосовое сообщение\n\n"
         "Я сгенерирую статью и спрошу куда публиковать!"
     )
 
+
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
-    await message.answer(
-        "🎤 Получил голосовое!\n\n"
-        "Напиши текстом тему которую ты продиктовал — пока работаем так.\n"
-        "Голосовое распознавание подключим после пополнения OpenAI баланса."
-    )
+    await message.answer("🎤 Распознаю голосовое...")
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        file_url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                voice_data = await resp.read()
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(voice_data)
+            tmp_path = tmp.name
+
+        with open(tmp_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
+                file=("voice.ogg", f.read()),
+                model="whisper-large-v3",
+                language="ru"
+            )
+        os.unlink(tmp_path)
+
+        topic = transcription.text
+        await message.answer(f"✅ Распознано: *{topic}*", parse_mode="Markdown")
+        await process_topic(message, topic, state)
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка распознавания: {e}")
+
 
 @dp.message(F.text)
 async def handle_text(message: Message, state: FSMContext):
     await process_topic(message, message.text, state)
+
 
 async def process_topic(message: Message, topic: str, state: FSMContext):
     await message.answer("⏳ Генерирую статью, подожди 20-30 секунд...")
@@ -152,6 +147,7 @@ async def process_topic(message: Message, topic: str, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
+
 @dp.callback_query(F.data == "pub_channel")
 async def pub_channel(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -160,6 +156,7 @@ async def pub_channel(callback: CallbackQuery, state: FSMContext):
     ok = await publish_to_channel(f"📝 {topic}\n\n{article}")
     await callback.message.answer("✅ Опубликовано в канал!" if ok else "❌ Ошибка публикации в канал")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "pub_wp")
 async def pub_wp(callback: CallbackQuery, state: FSMContext):
@@ -174,23 +171,29 @@ async def pub_wp(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Ошибка WordPress. Проверь WP_URL, WP_USER, WP_PASSWORD в Variables.")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "pub_all")
 async def pub_all(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     article = data.get("article", "")
     topic = data.get("topic", "")
     result = ""
+
     if CHANNEL_ID:
         ok = await publish_to_channel(f"📝 {topic}\n\n{article}")
         result += "✅ Канал\n" if ok else "❌ Канал — ошибка\n"
+
     await callback.message.answer("⏳ Публикую в WordPress...")
     link = await publish_to_wordpress(topic, article)
     result += f"✅ WordPress: {link}\n" if link else "❌ WordPress — ошибка\n"
+
     await callback.message.answer(f"📢 *Результат:*\n{result}", parse_mode="Markdown")
     await callback.answer()
 
+
 async def main():
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
